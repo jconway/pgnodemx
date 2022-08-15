@@ -35,6 +35,7 @@
 #ifndef CGROUP2_SUPER_MAGIC
 #define CGROUP2_SUPER_MAGIC  0x63677270
 #endif
+#include <sys/stat.h>
 #include <sys/vfs.h>
 #include <unistd.h>
 
@@ -50,6 +51,7 @@
 #include "qunique.h"
 #endif
 #include "lib/stringinfo.h"
+#include "miscadmin.h"
 #include "utils/builtins.h"
 #include "utils/guc_tables.h"
 #include "utils/int8.h"
@@ -65,20 +67,40 @@
 
 #define DEFCONTROLLER	"memory"
 
-/* context gathering functions */
+/* static functions */
 static void create_default_cgpath(char *str, int curlen);
 static void init_or_reset_cgpath(void);
 static StringInfo candidate_controller_path(char *controller, char *r);
 static StringInfo check_and_fix_controller_path(char *controller, char *r);
+static int set_subtree(char *subtree);
+static char*get_subtree_cf(char *subtree, char *cf);
+static int set_subtree_controls(char *subtree);
+static int write_cgroup_file(char *fullpath, char *value);
 
-/* custom GUC vars */
+/* exported vars */
 bool	containerized = false;
 char *cgrouproot = NULL;
 bool cgroup_enabled = true;
-
-/* module globals */
+bool subtree_enabled = false;
+char *default_subtree = NULL;
+bool default_views_parent = true;
+char *delegated_controllers = NULL;
 char *cgmode = NULL;
 kvpairs *cgpath = NULL;
+char *databases_subtree_string = NULL;
+char *roles_subtree_string = NULL;
+char *delegated_options[] = {
+	"memory.high",
+	"memory.low",
+	"cpu.max",
+	"io.max"
+};
+char *delegated_options_values[NUM_DELEGATED_OPTIONS];
+
+/* static vars */
+static char *pg_cgroot = NULL;
+static bool subtree_inited = false;
+static bool current_subtree_is_new = false;
 
 /*
  * Take input filename from caller, make sure it is acceptable
@@ -102,9 +124,45 @@ get_fq_cgroup_path(FunctionCallInfo fcinfo)
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				errmsg("pgnodemx: missing \".\" in filename %s", PROC_CGROUP_FILE)));
 
-	len = (p - fname);
-	controller = pnstrdup(fname, len);
-	appendStringInfo(ftr, "%s/%s", get_cgpath_value(controller), fname);
+	if (is_cgroup_v2 && 
+		subtree_enabled &&
+		default_views_parent)
+	{
+		size_t		deflen = strlen(default_subtree);
+		size_t		rawlen;
+		char	   *rawstr;
+		char	   *ptr;
+
+		/* in cgroup v2 there should only be one entry */
+		rawstr = read_one_nlsv(PROC_CGROUP_FILE);
+		rawlen = strlen(rawstr);
+		ptr = rawstr + (rawlen) - deflen;
+
+		/* determine if we are in the default subtree */
+		if (strcmp(ptr, default_subtree) == 0)
+		{
+			/*
+			 * If we are in the default subtree with default_views_parent true,
+			 * we must have a unified controller hierarchy. That in turn means
+			 * we can simply append fname to pg_cgroot and be done with it.
+			 */
+			appendStringInfo(ftr, "%s/%s", pg_cgroot, fname);
+		}
+		else
+		{
+			/* not using default subtree */
+			len = (p - fname);
+			controller = pnstrdup(fname, len);
+			appendStringInfo(ftr, "%s/%s", get_cgpath_value(controller), fname);
+		}
+	}
+	else
+	{
+		/* Fastpath the case where we are not using subtrees */
+		len = (p - fname);
+		controller = pnstrdup(fname, len);
+		appendStringInfo(ftr, "%s/%s", get_cgpath_value(controller), fname);
+	}
 
 	return pstrdup(ftr->data);
 }
@@ -755,11 +813,11 @@ set_cgpath(void)
 		int				i;
 		char		   *defpath = NULL;
 
-		lines = read_nlsv(PROC_CGROUP_FILE, &nlines);
+		lines = read_nlsv(ftr, &nlines);
 		if (nlines == 0)
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-					errmsg("pgnodemx: no cgroup paths found in file %s", PROC_CGROUP_FILE)));
+					errmsg("pgnodemx: no cgroup paths found in file %s", ftr)));
 
 		cgpath->nkvp = nlines;
 		cgpath->keys = (char **) repalloc(cgpath->keys, cgpath->nkvp * sizeof(char *));
@@ -793,7 +851,7 @@ set_cgpath(void)
 			else
 				ereport(ERROR,
 						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-						errmsg("pgnodemx: malformed cgroup path found in file %s", PROC_CGROUP_FILE)));
+						errmsg("pgnodemx: malformed cgroup path found in file %s", ftr)));
 
 			r = strchr(p, ':');
 			/* advance past the ":" and also the "/" */
@@ -802,7 +860,7 @@ set_cgpath(void)
 			else
 				ereport(ERROR,
 						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-						errmsg("pgnodemx: malformed cgroup path found in file %s", PROC_CGROUP_FILE)));
+						errmsg("pgnodemx: malformed cgroup path found in file %s", ftr)));
 
 			len = ((r - p) - 2);
 
@@ -942,4 +1000,303 @@ get_cgpath_value(char *key)
 
 	/* unreached */
 	return "unknown";
+}
+
+#define NUM_BUSY_RETRIES	10000
+/*
+ * Set the cgroup v2 subtree to the requested subtree.
+ * 
+ * If necessary create the default subtree and move all postgres pids
+ * there first.
+ * 
+ * Also create the target subtree if it does not exist.
+ *
+ * Return false on error and let the caller decide what to do
+ * rather than throwing an ERROR (or FATAL) here.
+ */
+bool
+set_cgroup_subtree(char *subtree)
+{
+	int		ret;
+	char   *subtree_control;
+	int		i = 0;
+
+	/*
+	 * fastpath exit if cgroup mode is not v2 or
+	 * not subtree enabled
+	 */
+	if (!is_cgroup_v2 || !subtree_enabled)
+		return false;
+
+	/*
+	 * Create requested subtree if it does not exist,
+	 * and place ourselves into it.
+	 */
+	ret = set_subtree(subtree);
+	if (ret != 0)
+		return false;
+
+	/*
+	 * We need to write delegated controllers to cgroup.subtree_control
+	 * in the parent dir.
+	 * Note: it would be better to do this only once globally,
+	 * but there was a timing issue when trying to do it during
+	 * postmaster init, and it should not hurt anything to write
+	 * the same list of delegated controllers once for each session.
+	 * This depends on delegated controllers GUC remaining PGC_POSTMASTER.
+	 */
+	subtree_control = psprintf("%s/%s",
+							   pg_cgroot,
+							   "cgroup.subtree_control");
+
+	/* need to retry for EBUSY */
+	do
+	{
+		i++;
+
+		ret = write_cgroup_file(subtree_control, delegated_controllers);
+		if (ret == 0)
+			break;
+
+		if (ret != EBUSY || i > NUM_BUSY_RETRIES)
+			return false;
+
+		elog(WARNING, "Control file %s busy, retrying", subtree_control);
+		usleep((useconds_t) 1000);
+	} while (ret == EBUSY);
+
+	/*
+	 * if this subtree was just created, we need to set any
+	 * default parameters associated with the subtree
+	 * (e.g. cpu limit, memory high/low, etc.). The check for
+	 * just created happens in set_subtree_controls()
+	 */
+	ret = set_subtree_controls(subtree);
+	if (ret != 0)
+		return false;
+
+	/* reset the cgpath now that our subtree is set */
+	set_cgpath();
+
+	return true;
+}
+
+/*
+ * Create default subtree if it does not exist,
+ * and move postmaster pid there.
+ */
+bool
+init_default_subtree(void)
+{
+	char		   *ftr = PROC_CGROUP_FILE;
+	char		   *rawstr;
+	struct stat		stat_struct;
+	char		   *default_subtree_path;
+	char		   *subtree_procs;
+	char		   *value;
+	int				ret;
+
+	/* only init once */
+	if (subtree_inited)
+		return true;
+
+	/*
+	 * Before doing anything, capture the original
+	 * root of the Postgres cgroup path
+	 */
+
+	/* read PROC_CGROUP_FILE, which for v2 has one line */
+	rawstr = read_one_nlsv(ftr);
+
+	/*
+	 * cgroup v2 PROC_CGROUP_FILE has one line
+	 * that always starts "0::/", so skip that
+	 * in order to get the relative path to the
+	 * unified set of cgroup controllers
+	 */
+	pg_cgroot = MemoryContextStrdup(TopMemoryContext,
+									psprintf("%s/%s",
+											 cgrouproot, (rawstr + 4)));
+
+	default_subtree_path = psprintf("%s/%s", pg_cgroot, default_subtree);
+
+	/* If the default subtree is not found, create it */
+	if (stat(default_subtree_path, &stat_struct) < 0)
+		mkdir(default_subtree_path, 0700);
+
+	/* Now move postmaster proc by appending to cgroup.procs in the subtree */
+	subtree_procs = psprintf("%s/%s",
+							 default_subtree_path,
+							 "cgroup.procs");
+
+	value = psprintf("%d", MyProcPid);
+	ret = write_cgroup_file(subtree_procs, value);
+	if (ret != 0)
+		return false;
+
+	subtree_inited = true;
+	return true;
+}
+
+/*
+ * Create default subtree if it does not exist,
+ * and move all pids there.
+ */
+static int
+set_subtree(char *subtree)
+{
+	struct stat		stat_struct;
+	char		   *subtree_path;
+	char		   *subtree_procs;
+	char		   *value;
+
+
+	/* setup relevant paths */
+	subtree_path = psprintf("%s/%s", pg_cgroot, subtree);
+	subtree_procs = psprintf("%s/%s",
+							 subtree_path,
+							 "cgroup.procs");
+
+	/* if not found, create it */
+	if (stat(subtree_path, &stat_struct) < 0)
+	{
+		mkdir(subtree_path, 0700);
+		current_subtree_is_new = true;
+	}
+	else
+		current_subtree_is_new = false;
+
+	value = psprintf("%d", MyProcPid);
+	return write_cgroup_file(subtree_procs, value);
+}
+
+static char*
+get_subtree_cf(char *subtree, char *cf)
+{
+	return psprintf("%s/%s/%s", pg_cgroot, subtree, cf);
+}
+
+/*
+ * Set any requested parameters associated with the subtree
+ * (e.g. cpu limit, memory high/low, etc.)
+ */
+static int
+set_subtree_controls(char *subtree)
+{
+	int		i;
+
+	/*
+	 * if this subtree was just created, we need to set any
+	 * default parameters associated with the subtree
+	 * (e.g. cpu limit, memory high/low, etc.). If it is not new
+	 * then we should not mess with whatever had already been set.
+	 */
+	if (current_subtree_is_new)
+	{
+		for (i = 0; i < NUM_DELEGATED_OPTIONS; ++i)
+		{
+			char   *value = delegated_options_values[i];
+
+			/* skip if not set */
+			if (value)
+			{
+				char	   *subtree_cf;
+				int			ret;
+
+				subtree_cf = get_subtree_cf(subtree, delegated_options[i]);
+				ret = write_cgroup_file(subtree_cf, value);
+				if (ret != 0)
+					return ret;
+			}
+		}
+	}
+	else
+		ereport(DEBUG1,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("cannot set controls for pre-existing subtree %s",
+						subtree)));
+
+	return 0;
+}
+
+static int
+write_cgroup_file(char *fullpath, char *value)
+{
+	FILE	   *fp = NULL;
+	int			ret = 0;
+
+	fp = fopen(fullpath, "we");
+	if (!fp)
+	{
+		ret = errno;
+		goto out;
+	}
+
+	ret = fprintf(fp, "%s", value);
+	if (ret < 0)
+	{
+		ret = errno;
+		goto out;
+	}
+
+	ret = fflush(fp);
+	if (ret)
+	{
+		ret = errno;
+		goto out;
+	}
+
+	fclose(fp);
+	return 0;
+
+out:
+	ereport(WARNING,
+			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+			 errmsg("failed to write \"%s\" to \"%s\" with errno %d",
+					value, fullpath, ret)));
+
+	if (fp)
+		fclose(fp);
+
+	return ret;
+}
+
+PG_FUNCTION_INFO_V1(pgnodemx_set_one_control);
+Datum
+pgnodemx_set_one_control(PG_FUNCTION_ARGS)
+{
+	char   *fqpath;
+	char   *cname = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	char   *cvalue = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	int		i;
+
+	if (!cgroup_enabled)
+		PG_RETURN_NULL();
+
+	if (!current_subtree_is_new)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("cannot set control for pre-existing subtree")));
+
+	/* check it is in allowed list */
+	for (i = 0; i < NUM_DELEGATED_OPTIONS; ++i)
+	{
+		if (strcmp(cname, delegated_options[i]) == 0)
+		{
+			int		ret;
+
+			fqpath = get_fq_cgroup_path(fcinfo);
+			ret = write_cgroup_file(fqpath, cvalue);
+			if (ret != 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("control set failed")));
+
+			PG_RETURN_TEXT_P(cstring_to_text("OK"));;
+		}
+	}
+
+	ereport(ERROR,
+			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+			 errmsg("failed to find control %s in allow list", cname)));
 }

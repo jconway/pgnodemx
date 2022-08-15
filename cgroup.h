@@ -49,6 +49,8 @@ extern void set_cgpath(void);
 extern int cgmembers(int64 **pids);
 extern char *get_cgpath_value(char *key);
 extern char *get_fq_cgroup_path(FunctionCallInfo fcinfo);
+extern bool set_cgroup_subtree(char *subtree);
+extern bool init_default_subtree(void);
 
 /* exported globals */
 extern char *cgmode;
@@ -56,5 +58,16 @@ extern kvpairs *cgpath;
 extern char *cgrouproot;
 extern bool containerized;
 extern bool cgroup_enabled;
+extern bool subtree_enabled;
+extern char *default_subtree;
+extern bool default_views_parent;
+extern char *delegated_controllers;
+extern char *databases_subtree_string;
+extern char *roles_subtree_string;
+extern char *session_subtree;
+/* keep in sync with delegated_options[] */
+#define NUM_DELEGATED_OPTIONS	4
+extern char *delegated_options[];
+extern char *delegated_options_values[];
 
 #endif	/* CGROUP_H */

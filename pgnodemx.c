@@ -46,11 +46,13 @@
 #include "catalog/pg_type.h"
 #endif
 #include "fmgr.h"
+#include "libpq/auth.h"
 #include "miscadmin.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/guc_tables.h"
 #include "utils/int8.h"
+#include "utils/varlena.h"
 
 #include "cgroup.h"
 #include "envutils.h"
@@ -115,7 +117,10 @@ Oid proc_pid_stat_sig[] = {INT4OID, TEXTOID, TEXTOID,
 Oid num_text_num_2_text_sig[] = {NUMERICOID, TEXTOID,
 								 NUMERICOID, TEXTOID, TEXTOID};
 
+/* exported functions */
 void _PG_init(void);
+void _PG_fini(void);
+bool check_string_list(char **newval, void **extra, GucSource source);
 Datum pgnodemx_cgroup_mode(PG_FUNCTION_ARGS);
 Datum pgnodemx_cgroup_path(PG_FUNCTION_ARGS);
 Datum pgnodemx_cgroup_process_count(PG_FUNCTION_ARGS);
@@ -134,7 +139,16 @@ Datum pgnodemx_envvar_bigint(PG_FUNCTION_ARGS);
 Datum pgnodemx_kdapi_setof_kv(PG_FUNCTION_ARGS);
 Datum pgnodemx_kdapi_scalar_bigint(PG_FUNCTION_ARGS);
 
+/* exported vars */
 bool proc_enabled = false;
+
+/* static functions */
+static bool get_string_in_list(char *slist, char *tgtname);
+static char*get_session_var(char *sdef, char *objtype, char *objattr, char *sessname);
+static void CA_hook(Port *port, int status);
+
+/* static vars */
+static ClientAuthentication_hook_type next_client_auth_hook = NULL;
 
 /*
  * Entrypoint of this module.
@@ -168,6 +182,38 @@ _PG_init(void)
 							   NULL, &cgrouproot, "/sys/fs/cgroup", PGC_POSTMASTER,
 							   0, NULL, NULL, NULL);
 
+	DefineCustomBoolVariable("pgnodemx.subtree_enabled",
+							 "True if cgroup subtree management is enabled",
+							 NULL, &subtree_enabled, false, PGC_POSTMASTER,
+							 0, NULL, NULL, NULL);
+
+	DefineCustomStringVariable("pgnodemx.default_subtree",
+							   "Default cgroup subtree",
+							   NULL, &default_subtree, "default", PGC_POSTMASTER,
+							   0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("pgnodemx.default_subtree_views_parent_path",
+							 "True if default subtree views the parent cgroup path",
+							 NULL, &default_views_parent, true, PGC_USERSET,
+							 0, NULL, NULL, NULL);
+
+	DefineCustomStringVariable("pgnodemx.databases_with_subtrees",
+							   "List of databases with customized cgroup v2 subtrees",
+							   NULL, &databases_subtree_string,
+							   "", PGC_SIGHUP,
+							   0, check_string_list, NULL, NULL);
+
+	DefineCustomStringVariable("pgnodemx.roles_with_subtrees",
+							   "List of roles with customized cgroup v2 subtrees",
+							   NULL, &roles_subtree_string,
+							   "", PGC_SIGHUP,
+							   0, check_string_list, NULL, NULL);
+
+	DefineCustomStringVariable("pgnodemx.delegated_controllers",
+							   "cgroup controllers delegated to subtrees",
+							   NULL, &delegated_controllers, "+cpu +cpuset +memory +io", PGC_POSTMASTER,
+							   0, NULL, NULL, NULL);
+
 	DefineCustomBoolVariable("pgnodemx.kdapi_enabled",
 							 "True if Kubernetes Downward API file system access is enabled",
 							 NULL, &kdapi_enabled, true, PGC_POSTMASTER,
@@ -178,12 +224,33 @@ _PG_init(void)
 							   NULL, &kdapi_path, "/etc/podinfo", PGC_POSTMASTER,
 							   0, NULL, NULL, NULL);
 
-	/* don't try to set cgmode unless cgroup is enabled */
 	if (set_cgmode())
 	{
+		/*
+		 * If we get this far, we at least know
+		 * cgroup_enabled is true and cgmode is not CGROUP_DISABLED
+		 */
+
 		/* must determine if containerized before setting cgpath */
 		set_containerized();
-		set_cgpath();
+
+		/* try to init default subtree if requested */
+		if (is_cgroup_v2 && 
+			subtree_enabled)
+		{
+			bool	ret = false;
+
+			ret = init_default_subtree();
+			if (!ret)
+			{
+				/*
+				 * If unable to init subtrees, there is not
+				 * much else we can do besides disabling subtrees.
+				 */
+				elog(WARNING, "cannot enable cgroup subtrees");
+				subtree_enabled = false;
+			}
+		}
 	}
 	else
 	{
@@ -216,8 +283,248 @@ _PG_init(void)
 	 */
 	proc_enabled = check_procfs();
 
+	/* Install backend session post-auth hook */
+	next_client_auth_hook = ClientAuthentication_hook;
+	ClientAuthentication_hook = CA_hook;
+
 	inited = true;
 }
+
+void
+_PG_fini(void)
+{
+	ClientAuthentication_hook = next_client_auth_hook;
+}
+
+/*
+ * check_string_list: GUC check_hook
+ * check string list: this just checks list syntax,
+ *                    not objname validity
+ */
+bool
+check_string_list(char **newval, void **extra, GucSource source)
+{
+	char		   *rawstring = NULL;
+	List		   *elemlist = NIL;
+	bool			result = true;
+
+	/* Need a modifiable copy of string */
+	rawstring = pstrdup(*newval);
+
+	/* Parse string into list of syscalls */
+	if (!SplitIdentifierString(rawstring, ',', &elemlist))
+	{
+		GUC_check_errdetail("List syntax is invalid.");
+		result = false;
+		goto out;
+	}
+
+out:
+	/* safe to release if NIL */
+	list_free(elemlist);
+
+	/* but pfree is not */
+	if (rawstring)
+		pfree(rawstring);
+
+	return result;
+}
+
+static bool
+get_string_in_list(char *slist, char *tgtname)
+{
+	char		   *rawstring = NULL;
+	List		   *elemlist = NIL;
+	ListCell	   *l;
+	bool			result = false;
+
+	if (slist == NULL)
+		return result;
+
+	/* Need a modifiable copy */
+	rawstring = pstrdup(slist);
+
+	/* Parse string into list of syscalls */
+	if (!SplitIdentifierString(rawstring, ',', &elemlist))
+		goto out;
+
+	/* add syscall specific rules to the filter */
+	foreach(l, elemlist)
+	{
+		char   *listelem = (char *) lfirst(l);
+
+		if (strcmp(listelem, tgtname) == 0)
+		{
+			result = true;
+			goto out;
+		}
+	}
+
+out:
+	/* safe to release if still NIL */
+	list_free(elemlist);
+
+	/* but pfree is not */
+	if (rawstring)
+		pfree(rawstring);
+
+	return result;
+}
+
+static char*
+get_session_var(char *sdef, char *objtype, char *sessname, char *objattr)
+{
+	char		 *cfgvarname;
+	const char   *ret;
+
+	cfgvarname = psprintf("%s_%s_%s", objtype, sessname, objattr);
+	ret = GetConfigOption(cfgvarname, true, false);
+	if (ret != NULL)
+		return pstrdup(ret);
+	else
+		return sdef;
+}
+
+/*
+ * CA_hook
+ *
+ * Entrypoint of the client authentication hook.
+ * It applies the session level cgroup subtree according to GUC settings.
+ */
+static void
+CA_hook(Port *port, int status)
+{
+	char *session_subtree = NULL;
+
+	/*
+	 * If authentication failed, the supplied socket will be
+	 * closed soon, so we don't need to do anything here.
+	 */
+	if (status != STATUS_OK)
+	{
+		if (next_client_auth_hook)
+			(*next_client_auth_hook)(port, status);
+
+		return;
+	}
+
+	/*
+	 * If database name is in the databases subtree list, look for customized
+	 * subtree default for that database
+	 */
+	if (get_string_in_list(databases_subtree_string, port->database_name))
+	{
+		int	i;
+
+		session_subtree = get_session_var(NULL, "database",
+										  port->database_name,
+										  "session.subtree");
+
+		for (i = 0; i < NUM_DELEGATED_OPTIONS; ++i)
+		{
+			delegated_options_values[i] = get_session_var(NULL, "database",
+														  port->database_name,
+														  delegated_options[i]);
+		}
+	}
+
+	/*
+	 * If username is in the roles subtree list, look for customized
+	 * subtree default for that role. Role subtree values override
+	 * database ones.
+	 */
+	if (get_string_in_list(roles_subtree_string, port->user_name))
+	{
+		int	i;
+
+		session_subtree = get_session_var(session_subtree, "role",
+										  port->user_name,
+										  "session.subtree");
+
+		for (i = 0; i < NUM_DELEGATED_OPTIONS; ++i)
+		{
+			delegated_options_values[i] = get_session_var(NULL, "role",
+														  port->user_name,
+														  delegated_options[i]);
+		}
+	}
+
+	/*
+	 * If neither database nor role were used to specifiy a subtree, then the
+	 * subtree must be the default one, so use that
+	 */
+	if (session_subtree == NULL)
+	{
+		int	i;
+
+		session_subtree = default_subtree;
+
+		/*
+		 * Ensure we don't use any previously set option values
+		 * with the default subtree, since it is supposed to be
+		 * unconstrained
+		 */
+		for (i = 0; i < NUM_DELEGATED_OPTIONS; ++i)
+		{
+			delegated_options_values[i] = NULL;
+		}
+	}
+
+	/* If we have a session subtree, and meet other criteria, try to set it now */
+	if (is_cgroup_v2 && 
+		subtree_enabled &&
+		session_subtree &&
+		IsUnderPostmaster)
+	{
+		if(!set_cgroup_subtree(session_subtree))
+		{
+			/*
+			 * If unable to set subtrees, there is not
+			 * much else we can do besides disabling them.
+			 */
+			elog(WARNING, "cannot set cgroup subtree");
+			subtree_enabled = false;
+		}
+	}
+
+	/* set the cgpath for the session */
+	set_cgpath();
+
+	if (next_client_auth_hook)
+		(*next_client_auth_hook)(port, status);
+}
+
+PG_FUNCTION_INFO_V1(pgnodemx_set_subtree);
+Datum
+pgnodemx_set_subtree(PG_FUNCTION_ARGS)
+{
+	char	   *req_subtree = text_to_cstring(PG_GETARG_TEXT_PP(0));
+
+	/* If we have a session subtree, and meet other criteria, try to set it now */
+	if (is_cgroup_v2 && 
+		subtree_enabled &&
+		req_subtree &&
+		IsUnderPostmaster)
+	{
+		if(!set_cgroup_subtree(req_subtree))
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					errmsg("pgnodemx: cannot set cgroup subtree %s", req_subtree)));
+		}
+		else
+		{
+			/* reset the cgpath for the session */
+			set_cgpath();
+			PG_RETURN_TEXT_P(cstring_to_text("OK"));
+		}
+	}
+	else
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				errmsg("pgnodemx: prerequisite not met to set cgroup subtree %s", req_subtree)));
+}
+
 
 PG_FUNCTION_INFO_V1(pgnodemx_cgroup_mode);
 Datum

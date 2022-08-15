@@ -1,7 +1,7 @@
 # pgnodemx
 
 ## Overview
-SQL functions that allow capture of node OS metrics from PostgreSQL
+SQL functions that allow management and capture of node OS metrics from PostgreSQL
 
 ## Security
 Executing role must have been granted pg_monitor membership (pgmonitor for PostgreSQL version 9.6 and below - see Compatibility section below).
